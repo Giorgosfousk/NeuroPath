@@ -1,8 +1,9 @@
 # neuro_path_pipeline.py
 """
 NeuroPath Wandering Detection System
-Includes: GeoLife Parser, Stop Detection, Deterministic Radius Clustering,
-Markov + LSTM Models, Multi-Vector Anomaly Detection, and Interactive HTML Mapping.
+Includes: GeoLife Parser, Stop Detection, Leader Stream Clustering (Infinite Memory),
+Place Registry Noise Filtering, Markov + LSTM Models, Multi-Vector Anomaly Detection,
+Interactive HTML Mapping, and Summary Statistics.
 """
 
 import os
@@ -84,11 +85,12 @@ def detect_stops(gps_data, dist_thresh=0.001, time_thresh=2 * 60):
 
 
 # -------------------------------
-# 2. Streaming Place Discovery (Deterministic Radius)
+# 2. Leader Clustering & Place Registry
 # -------------------------------
-class PlaceDiscovery:
-    def __init__(self, radius_threshold=0.0015):
-        # 0.0015 degrees is roughly 150 meters
+class LeaderClusterer:
+    """Infinite memory stream clustering based on distance radius."""
+
+    def __init__(self, radius_threshold=0.0025):
         self.radius = radius_threshold
         self.places = {}
         self.next_id = 0
@@ -98,7 +100,7 @@ class PlaceDiscovery:
         nearest_cid = None
         min_dist = float('inf')
 
-        # Find the closest existing place
+        # Find the closest existing cluster
         for cid, coords in self.places.items():
             dist = np.sqrt((coords['lat'] - lat) ** 2 + (coords['lon'] - lon) ** 2)
             if dist < min_dist:
@@ -121,6 +123,58 @@ class PlaceDiscovery:
             self.places[new_cid] = {'lat': lat, 'lon': lon, 'weight': 1}
             self.next_id += 1
             return new_cid, True
+
+
+class PlaceRegistry:
+    """Filters noisy raw clusters into stable places based on visit frequency."""
+
+    def __init__(self, stability_threshold=5, merge_radius=0.0025):
+        self.places = {}  # place_id -> info
+        self.cluster_to_place = {}
+        self.next_place_id = 0
+        self.stability_threshold = stability_threshold
+        self.merge_radius = merge_radius
+
+        self.cluster_visit_counts = defaultdict(int)
+
+    def update(self, cluster_id, stop):
+        lat, lon = stop['lat'], stop['lon']
+
+        # Track how stable this cluster is
+        self.cluster_visit_counts[cluster_id] += 1
+
+        # If cluster already mapped -> return existing place
+        if cluster_id in self.cluster_to_place:
+            place_id = self.cluster_to_place[cluster_id]
+            self._update_place(place_id, lat, lon)
+            return place_id, False
+
+        # Only promote to place if stable enough
+        if self.cluster_visit_counts[cluster_id] < self.stability_threshold:
+            return None, False
+
+        # Try to merge with existing place
+        for pid, place in self.places.items():
+            dist = np.sqrt((place['lat'] - lat) ** 2 + (place['lon'] - lon) ** 2)
+            if dist < self.merge_radius:
+                self.cluster_to_place[cluster_id] = pid
+                self._update_place(pid, lat, lon)
+                return pid, False
+
+        # Otherwise create new place
+        pid = self.next_place_id
+        self.places[pid] = {'lat': lat, 'lon': lon, 'visits': 1}
+        self.cluster_to_place[cluster_id] = pid
+        self.next_place_id += 1
+
+        return pid, True
+
+    def _update_place(self, pid, lat, lon):
+        place = self.places[pid]
+        w = place['visits']
+        place['lat'] = (place['lat'] * w + lat) / (w + 1)
+        place['lon'] = (place['lon'] * w + lon) / (w + 1)
+        place['visits'] += 1
 
 
 # -------------------------------
@@ -229,8 +283,8 @@ def plot_clusters_on_map(stops, cluster_ids, output_filename="wandering_map.html
         folium.CircleMarker(
             location=[stop['lat'], stop['lon']],
             radius=8,
-            popup=f"<b>Cluster {cid}</b><br>Time: {stop['time_str']}",
-            tooltip=f"Cluster {cid}",
+            popup=f"<b>Place {cid}</b><br>Time: {stop['time_str']}",
+            tooltip=f"Place {cid}",
             color=marker_color,
             fill=True,
             fill_color=marker_color,
@@ -254,54 +308,83 @@ if __name__ == "__main__":
 
     print("--- Parsing GPS Stream ---")
     gps_data = parse_geolife_data(raw_file_content)
-    stops = detect_stops(gps_data)
+    all_stops = detect_stops(gps_data)
 
-    if len(stops) == 0:
+    if len(all_stops) == 0:
         print("No stops detected.")
         exit()
 
     print("\n--- Initializing Caretaker Wandering Detection ---")
-    place_discovery = PlaceDiscovery()
+    # Both stages use the 0.0025 threshold you requested
+    leader_clusterer = LeaderClusterer(radius_threshold=0.0025)
+    registry = PlaceRegistry(stability_threshold=2, merge_radius=0.0025)
     markov = MarkovModel()
 
     history_buffer = []
     visit_counts = defaultdict(int)
     place_time_profiles = defaultdict(set)
+
+    stable_stops = []
     assigned_cluster_ids = []
 
     lstm_model, encoder = None, None
     N_STEPS = 2
-    BURN_IN_PERIOD = 1  # Lowered so you can see anomaly checks trigger immediately
+    BURN_IN_PERIOD = 1
 
-    for idx, stop in enumerate(stops):
+    # Initialize statistics tracker
+    stats = {
+        'total_raw_stops': len(all_stops),
+        'stable_stops_processed': 0,
+        'spatial_anomalies': 0,
+        'destination_anomalies': 0,
+        'temporal_anomalies': 0,
+        'route_markov_anomalies': 0,
+        'route_lstm_anomalies': 0
+    }
+
+    for idx, stop in enumerate(all_stops):
         time_str = stop['time_str']
         time_shift = stop['time_shift']
         print(f"\n[{time_str}] User stopped at Lat: {stop['lat']:.5f}, Lon: {stop['lon']:.5f}")
 
-        is_training_phase = idx < BURN_IN_PERIOD
-        cid, is_new_place = place_discovery.update(stop)
+        # Process through Leader Clusterer and Place Registry
+        raw_cluster_id, _ = leader_clusterer.update(stop)
+        cid, is_new_place = registry.update(raw_cluster_id, stop)
+
+        # Noise Filter: Skip anomaly checks and mapping if the place isn't stable yet
+        if cid is None:
+            print(f"  -> [Noise Filter] Gathering stability data. Not yet recognized as a stable place.")
+            continue
+
+        # If stable, append to our active tracking lists
+        stats['stable_stops_processed'] += 1
+        stable_stops.append(stop)
         assigned_cluster_ids.append(cid)
+        is_training_phase = len(stable_stops) <= BURN_IN_PERIOD
 
         if is_training_phase:
-            print(f"  -> [Warm-up] Observing baseline. Mapped Cluster {cid} during {time_shift}.")
+            print(f"  -> [Warm-up] Observing baseline. Mapped Place {cid} during {time_shift}.")
         else:
             # 1. SPATIAL CHECK
             if is_new_place:
-                print(f"  -> [ALERT: SPATIAL] User wandered to a completely unknown location! (Cluster {cid})")
+                stats['spatial_anomalies'] += 1
+                print(f"  -> [ALERT: SPATIAL] User wandered to a completely unknown location! (Place {cid})")
             else:
-                print(f"  -> [Location] Recognized known place: Cluster {cid}")
+                print(f"  -> [Location] Recognized known place: Place {cid}")
 
                 # 2. DESTINATION CHECK
                 total_visits = max(1, sum(visit_counts.values()))
                 destination_prob = visit_counts[cid] / total_visits
                 if destination_prob < 0.05:
+                    stats['destination_anomalies'] += 1
                     print(
                         f"  -> [WARNING: DESTINATION] Rare destination. User only goes here {destination_prob:.1%} of the time.")
 
                 # 3. TEMPORAL CHECK
                 if time_shift not in place_time_profiles[cid]:
+                    stats['temporal_anomalies'] += 1
                     print(
-                        f"  -> [ALERT: TEMPORAL] User has NEVER been to Cluster {cid} during the {time_shift} before!")
+                        f"  -> [ALERT: TEMPORAL] User has NEVER been to Place {cid} during the {time_shift} before!")
 
             # 4. SEQUENTIAL CHECK
             if len(history_buffer) >= N_STEPS:
@@ -309,12 +392,14 @@ if __name__ == "__main__":
                 curr_place = history_buffer[-1]
 
                 is_m_anom, m_prob = markov.check_anomaly(curr_place, cid)
-                if is_m_anom: 
+                if is_m_anom:
+                    stats['route_markov_anomalies'] += 1
                     print(f"  -> [WARNING: ROUTE (Markov)] Unlikely path taken. Probability: {m_prob:.2%}")
 
                 if lstm_model is not None:
                     is_l_anom, l_prob = check_lstm_anomaly(lstm_model, encoder, current_seq, cid)
-                    if is_l_anom: 
+                    if is_l_anom:
+                        stats['route_lstm_anomalies'] += 1
                         print(f"  -> [WARNING: ROUTE (LSTM)] Unlikely path taken. Probability: {l_prob:.2%}")
 
         # --- Update System Memory ---
@@ -326,8 +411,25 @@ if __name__ == "__main__":
             markov.update(history_buffer[-2:])
             markov.normalize()
 
-        if len(history_buffer) >= N_STEPS + 1 and (idx == BURN_IN_PERIOD or idx % 4 == 0):
+        if len(history_buffer) >= N_STEPS + 1 and (
+                len(stable_stops) == BURN_IN_PERIOD + 1 or len(stable_stops) % 4 == 0):
             lstm_model, encoder = train_lstm(history_buffer, n_steps=N_STEPS, epochs=20)
 
-    # --- Generate Interactive Map ---
-    plot_clusters_on_map(stops, assigned_cluster_ids)
+    # --- Print Summary Statistics ---
+    print("\n" + "=" * 50)
+    print("      WANDERING DETECTION SUMMARY STATISTICS")
+    print("=" * 50)
+    print(f"Total Raw Stops Detected:          {stats['total_raw_stops']}")
+    print(f"Stable Stops Processed:            {stats['stable_stops_processed']}")
+    print(f"Unique Stable Places Identified:   {len(registry.places)}")
+    print("-" * 50)
+    print("ANOMALY BREAKDOWN:")
+    print(f"Spatial Alerts (New Places):       {stats['spatial_anomalies']}")
+    print(f"Destination Warnings (Rare):       {stats['destination_anomalies']}")
+    print(f"Temporal Alerts (Odd Hours):       {stats['temporal_anomalies']}")
+    print(f"Route Warnings (Markov Chain):     {stats['route_markov_anomalies']}")
+    print(f"Route Warnings (LSTM Predict):     {stats['route_lstm_anomalies']}")
+    print("=" * 50)
+
+    # --- Generate Interactive Map using only stable stops ---
+    plot_clusters_on_map(stable_stops, assigned_cluster_ids)
